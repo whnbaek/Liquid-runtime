@@ -92,6 +92,9 @@ This readers produces the following outputs::
   .AddOptionalArg("shuffle_after_epoch",
       R"code(If set to True, the reader shuffles the entire  dataset after each epoch.)code",
       false)
+  .AddOptionalArg("cache_size",
+      R"code(Number of images to cache per DL.)code",
+      0)
   .AddOptionalArg<string>("file_root",
       R"code(Path to a directory that contains the data files.
 

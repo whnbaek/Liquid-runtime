@@ -116,6 +116,19 @@ This argument is ignored when file paths are taken from ``file_list`` or ``files
       kKnownExtensionsGlob)
   .AddOptionalArg<bool>("case_sensitive_filter", R"(If set to True, the filter will be matched
 case-sensitively, otherwise case-insensitively.)", false)
+.AddOptionalArg("cache_size",
+      R"code(If a value is set, it is the number of items in shared memory cache
+per loader.)code",
+      static_cast<int>(0))
+.AddOptionalArg("node_ip",
+      R"code(Ip of the other node.)code",
+      std::string())
+.AddOptionalArg("node_ip_list",
+      R"code(Ip of the other nodes in node ID order.)code",
+      std::vector<std::string>{})
+.AddOptionalArg("node_port_list",
+      R"code(start port of the other nodes in node ID order.)code",
+      std::vector<int>{})
   .AddParent("LoaderBase");
 
 

@@ -15,6 +15,15 @@
 #ifndef DALI_OPERATORS_READER_LOADER_LOADER_H_
 #define DALI_OPERATORS_READER_LOADER_LOADER_H_
 
+#include <fcntl.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
+#include <sys/uio.h>
+#include <unistd.h>
+
 #include <list>
 #include <map>
 #include <memory>
@@ -26,6 +35,7 @@
 #include <vector>
 #include <deque>
 #include <atomic>
+#include <cstring>
 
 #include "dali/core/nvtx.h"
 #include "dali/core/common.h"
@@ -33,6 +43,7 @@
 #include "dali/pipeline/operator/op_spec.h"
 #include "dali/pipeline/data/tensor.h"
 #include "dali/operators/decoder/cache/image_cache_factory.h"
+#include "dali/operators/reader/loader/commands.h"
 
 namespace dali {
 
@@ -42,6 +53,8 @@ DLL_PUBLIC size_t start_index(const size_t shard_id,
 
 DLL_PUBLIC Index num_samples(const size_t shard_num,
                              const size_t size);
+
+DLL_PUBLIC int initialize_socket(int port, std::string ip_addr);
 /**
  * @brief Base class for Loaders, responsible for reading samples from resource of some kind
  *        into memory.
@@ -61,8 +74,13 @@ class Loader {
                           * options.GetArgument<int>("max_batch_size")),
       tensor_init_bytes_(options.GetArgument<int>("tensor_init_bytes")),
       seed_(options.GetArgument<Index>("seed")),
+      cache_size_orig_(options.GetArgument<int>("cache_size")),
+      shuffle_seed_(options.GetArgument<int>("shuffle_seed")),
       shard_id_(options.GetArgument<int>("shard_id")),
       num_shards_(options.GetArgument<int>("num_shards")),
+      num_nodes_(options.GetArgument<int>("num_nodes")),
+      node_id_(options.GetArgument<int>("node_id")),
+      resume_(options.GetArgument<bool>("resume")),
       copy_read_data_(false),
       read_ahead_(options.GetArgument<bool>("read_ahead")),
       stick_to_shard_(options.GetArgument<bool>("stick_to_shard")),
@@ -329,9 +347,19 @@ class Loader {
   // control return of tensors
   std::mutex empty_tensors_mutex_;
 
+  // caching
+  const int cache_size_orig_;
+
+  // shuffle seed
+  const int shuffle_seed_;
+
   // sharding
   const int shard_id_;
   const int num_shards_;
+  const int num_nodes_;
+  const int node_id_;
+  const bool resume_;
+  std::mutex net_mutex_;
 
   // if read data need to be copied or can be just shared with tensor
   bool copy_read_data_;
@@ -379,6 +407,7 @@ class Loader {
   };
 
   std::deque<ShardBoundaries> shards_;
+  const int num_shards_per_node_ = num_shards_ / num_nodes_;
 };
 
 template<typename T, typename... Args>

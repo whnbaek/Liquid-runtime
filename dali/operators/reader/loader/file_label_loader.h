@@ -16,8 +16,16 @@
 #define DALI_OPERATORS_READER_LOADER_FILE_LABEL_LOADER_H_
 
 #include <dirent.h>
-#include <sys/stat.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
+#include <sys/uio.h>
+#include <unistd.h>
 
 #include <fstream>
 #include <string>
@@ -25,10 +33,13 @@
 #include <utility>
 #include <vector>
 #include <algorithm>
+#include <thread>
 
 #include "dali/core/common.h"
 #include "dali/operators/reader/loader/loader.h"
 #include "dali/operators/reader/loader/filesystem.h"
+#include "dali/operators/reader/loader/commands.h"
+#include "dali/operators/shmcache/posixshmem.h"
 #include "dali/util/file.h"
 
 namespace dali {
@@ -46,7 +57,8 @@ class DLL_PUBLIC FileLabelLoader : public Loader<CPUBackend, ImageLabelWrapper> 
     : Loader<CPUBackend, ImageLabelWrapper>(spec),
       shuffle_after_epoch_(shuffle_after_epoch),
       current_index_(0),
-      current_epoch_(0) {
+      current_epoch_(0),
+      caching_done_(false) {
 
       vector<string> files;
       vector<int> labels;
@@ -98,6 +110,39 @@ class DLL_PUBLIC FileLabelLoader : public Loader<CPUBackend, ImageLabelWrapper> 
         }
       }
 
+      if ((spec.HasArgument("node_ip_list") ^ spec.HasArgument("node_port_list")) == 1)
+        DALI_ENFORCE(1, "node_ip_list and node_port_list must be specified together");
+
+      if (spec.HasArgument("node_ip_list")) {
+        node_ip_list_ = spec.GetRepeatedArgument<std::string>("node_ip_list");
+        if (node_ip_list_.size() > 0)
+          dist_mint = true;
+      }
+      if (spec.HasArgument("node_port_list")) {
+        node_port_list_ = spec.GetRepeatedArgument<int>("node_port_list");
+        if (node_port_list_.size() > 0)
+          dist_mint = true;
+      }
+
+      DALI_ENFORCE(node_ip_list_.size() == node_port_list_.size(),
+                   "Length and port and IP list must be same");
+
+      // Init the clients
+      if (dist_mint) {
+        DALI_ENFORCE(cache_size_orig_ > 0, "Cache size must be non zero in dist mint");
+        for (unsigned int i = 0; i < node_port_list_.size(); i++) {
+          if (static_cast<int>(i) == node_id_) {
+            shard_port_list_.push_back(0);
+            server_fd_.push_back(0);
+          } else {
+            shard_port_list_.push_back(node_port_list_[i] + shard_id_);
+            server_fd_.push_back(initialize_socket(shard_port_list_[i], node_ip_list_[i]));
+          }
+        }
+        DALI_ENFORCE(server_fd_.size() == node_ip_list_.size(),
+                     "Error in starting client connection");
+      }
+
       /*
       * Those options are mutually exclusive as `shuffle_after_epoch` will make every shard looks differently
       * after each epoch so coexistence with `stick_to_shard` doesn't make any sense
@@ -123,6 +168,17 @@ class DLL_PUBLIC FileLabelLoader : public Loader<CPUBackend, ImageLabelWrapper> 
 
   void PrepareEmpty(ImageLabelWrapper &tensor) override;
   void ReadSample(ImageLabelWrapper &tensor) override;
+
+  ~FileLabelLoader() {
+    if (dist_mint) {
+      for (unsigned int i = 0; i < node_port_list_.size(); i++) {
+        if (server_fd_[i] > 0) {
+          close(server_fd_[i]);
+          shutdown(server_fd_[i], 0);
+        }
+      }
+    }
+  }
 
  protected:
   Index SizeImpl() override;
@@ -176,10 +232,18 @@ class DLL_PUBLIC FileLabelLoader : public Loader<CPUBackend, ImageLabelWrapper> 
     }
     DALI_ENFORCE(SizeImpl() > 0, "No files found.");
 
+    Index size_per_shard = SizeImpl() / num_shards_;
+    if (cache_size_orig_ > size_per_shard) {
+      extra_cache_size_ = cache_size_orig_ - size_per_shard;
+      cache_size_ = size_per_shard;
+    } else {
+      cache_size_ = cache_size_orig_;
+    }
+
     if (shuffle_) {
       // seeded with hardcoded value to get
       // the same sequence on every shard
-      std::mt19937 g(kDaliDataloaderSeed);
+      std::mt19937 g(kDaliDataloaderSeed + shuffle_seed_);
       std::shuffle(image_label_pairs_.begin(), image_label_pairs_.end(), g);
     }
     Reset(true);
@@ -191,19 +255,113 @@ class DLL_PUBLIC FileLabelLoader : public Loader<CPUBackend, ImageLabelWrapper> 
     } else {
       current_index_ = 0;
     }
+    index_start_ = current_index_;
+    index_end_ = current_index_ + SizeImpl() / num_shards_;
 
-    current_epoch_++;
+    // current_epoch_++;
 
     if (shuffle_after_epoch_) {
-      std::mt19937 g(kDaliDataloaderSeed + current_epoch_);
+      std::mt19937 g(kDaliDataloaderSeed + current_epoch_ + shuffle_seed_);
       std::shuffle(image_label_pairs_.begin(), image_label_pairs_.end(), g);
+    }
+
+  // If the epoch count is 1 here, it means we have completed
+  // epoch 1. SO stop caching beyond this point
+  if (current_epoch_ == 1) {
+    caching_done_ = true;
+    if (num_nodes_ > 1 && cache_size_ > 0 && !resume_) {
+      // if we have extra items to cache, handle here
+      if (extra_cache_size_ > 0 && dist_mint) {
+        vector<string> items_not_in_node;
+        for (int it = 0; it < num_nodes_; it++) {
+          if (it != node_id_)
+            items_not_in_node.insert(items_not_in_node.end(),
+                                     shm_cache_index_list_other_nodes[it].begin(),
+                                     shm_cache_index_list_other_nodes[it].end());
+        }
+        // Get a random shuffle order at each node so that what is in cache of each node is random
+        // halps balance nodes to remote caches
+        std::mt19937 gen_s(shuffle_seed_ + node_id_);
+        std::shuffle(items_not_in_node.begin(), items_not_in_node.end(), gen_s);
+        Index items_per_shard = items_not_in_node.size() / num_shards_per_node_;
+        Index start_idx = (shard_id_ % num_shards_per_node_) * extra_cache_size_;
+        Index end_idx = (shard_id_ % num_shards_per_node_ + 1) * extra_cache_size_;
+        mint_prefetcher =
+            std::thread(shm::prefetch_cache, items_not_in_node, start_idx, end_idx, file_root_);
+        prefetcher_running = true;
+      }
     }
   }
 
+  // Create a shuffled list for caching
+  // Sort it so that search becomes easier
+  if (!caching_done_ && cache_size_ > 0) {
+    // Get the cache list for other nodes
+    if (num_nodes_ > 1) {
+      shm_cache_index_list_other_nodes.resize(num_nodes_);
+      for (int nid = 0; nid < num_nodes_; nid++) {
+        if (nid == node_id_) {
+          // We are in the current node; do nothing
+          continue;
+        }
+        vector<string> nid_list = shm_cache_index_list_other_nodes[nid];
+        // Resize list to the total size of shards in this node
+        for (int sh = 0; sh < num_shards_per_node_; sh++) {
+          std::mt19937 gen(shuffle_seed_);
+          Index shard_start_idx = start_index(num_shards_per_node_ * nid + sh, num_shards_, Size());
+          Index shard_end_idx = shard_start_idx + Size() / num_shards_;
+          Index shard_size = shard_end_idx - shard_start_idx;
+          vector<int> cache_list_per_shard(shard_size);
+          std::iota(cache_list_per_shard.begin(), cache_list_per_shard.end(), shard_start_idx);
+          std::shuffle(cache_list_per_shard.begin(), cache_list_per_shard.end(), gen);
+          cache_list_per_shard.resize(cache_size_);
+          std::sort(cache_list_per_shard.begin(), cache_list_per_shard.end());
+          vector<string> cache_list_per_shard_name;
+          for (unsigned int k = 0; k < cache_list_per_shard.size(); k++) {
+            cache_list_per_shard_name.push_back(image_label_pairs_[cache_list_per_shard[k]].first);
+          }
+          nid_list.insert(nid_list.end(), cache_list_per_shard_name.begin(),
+                          cache_list_per_shard_name.end());
+        }
+        std::sort(nid_list.begin(), nid_list.end());
+        shm_cache_index_list_other_nodes[nid] = nid_list;
+      }
+    }
+
+    std::mt19937 gen(shuffle_seed_);
+    shm_cache_index_list_.resize(Size() / num_shards_);
+    std::iota(shm_cache_index_list_.begin(), shm_cache_index_list_.end(), index_start_);
+    std::shuffle(shm_cache_index_list_.begin(), shm_cache_index_list_.end(), gen);
+    shm_cache_index_list_.resize(cache_size_);
+    std::sort(shm_cache_index_list_.begin(), shm_cache_index_list_.end());
+    vector<string> shm_cache_name_list_;
+    for (unsigned int k = 0; k < shm_cache_index_list_.size(); k++)
+      shm_cache_name_list_.push_back(image_label_pairs_[shm_cache_index_list_[k]].first);
+  }
+
+  current_epoch_++;
+
+  if (resume_)
+    caching_done_ = true;
+}
+
   using Loader<CPUBackend, ImageLabelWrapper>::shard_id_;
   using Loader<CPUBackend, ImageLabelWrapper>::num_shards_;
+  using Loader<CPUBackend, ImageLabelWrapper>::shuffle_seed_;
+  using Loader<CPUBackend, ImageLabelWrapper>::cache_size_orig_;
+  using Loader<CPUBackend, ImageLabelWrapper>::num_nodes_;
+  using Loader<CPUBackend, ImageLabelWrapper>::node_id_;
+  using Loader<CPUBackend, ImageLabelWrapper>::resume_;
+  using Loader<CPUBackend, ImageLabelWrapper>::seed_;
+  using Loader<CPUBackend, ImageLabelWrapper>::num_shards_per_node_;
 
-  string file_root_, file_list_;
+  string file_root_, file_list_, node_ip_;
+  vector<std::string> node_ip_list_;
+  vector<int> node_port_list_;
+  vector<int> shard_port_list_;
+  vector<int> server_fd_;
+  int extra_cache_size_ = 0;
+  int cache_size_ = 0;
   vector<std::pair<string, int>> image_label_pairs_;
   vector<string> filters_;
 
@@ -216,6 +374,15 @@ class DLL_PUBLIC FileLabelLoader : public Loader<CPUBackend, ImageLabelWrapper> 
   bool shuffle_after_epoch_;
   Index current_index_;
   int current_epoch_;
+  bool caching_done_;
+  int index_start_;
+  int index_end_;
+  bool dist_mint = false;
+  std::thread mint_prefetcher;
+  bool prefetcher_running = false;
+  vector<int> shm_cache_index_list_;
+  vector<vector<string>> shm_cache_index_list_other_nodes;
+  vector<std::string> shm_cached_items_;
   FileStream::MappingReserver mmap_reserver_;
 };
 
