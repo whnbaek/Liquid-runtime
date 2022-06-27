@@ -85,7 +85,8 @@ class nvJPEGDecoder : public Operator<MixedBackend>, CachedDecoderImpl {
     nvjpeg2k_thread_(1,
                      spec.GetArgument<int>("device_id"),
                      spec.GetArgument<bool>("affine"),
-                     "image decoder nvJPEG2k") {
+                     "image decoder nvJPEG2k"),
+    tempfile_name_(spec.GetArgument<std::string>("tempfile_name")) {
 #if IS_HW_DECODER_COMPATIBLE
     // if hw_decoder_load is not present in the schema (crop/sliceDecoder) then it is not supported
     bool try_init_hw_decoder = false;
@@ -264,6 +265,8 @@ class nvJPEGDecoder : public Operator<MixedBackend>, CachedDecoderImpl {
     ReserveSampleContainers();
 
     RegisterTestCounters();
+
+    tempfile_.open(tempfile_name_);
   }
 
   ~nvJPEGDecoder() override {
@@ -328,6 +331,8 @@ class nvJPEGDecoder : public Operator<MixedBackend>, CachedDecoderImpl {
       std::cerr << "Fatal error: exception in ~nvJPEGDecoder():\n" << e.what() << std::endl;
       std::terminate();
     }
+
+    tempfile_.close();
   }
 
   bool SetupImpl(std::vector<OutputDesc> &output_desc, const MixedWorkspace &ws) override {
@@ -338,9 +343,15 @@ class nvJPEGDecoder : public Operator<MixedBackend>, CachedDecoderImpl {
 
   using dali::OperatorBase::Run;
   void Run(MixedWorkspace &ws) override {
+    std::chrono::high_resolution_clock::time_point begin =
+        std::chrono::high_resolution_clock::now();
     SetupSharedSampleParams(ws);
     ParseImagesInfo(ws);
     ProcessImages(ws);
+    std::chrono::high_resolution_clock::time_point end = std::chrono::high_resolution_clock::now();
+    double time_elapsed =
+        std::chrono::duration_cast<std::chrono::duration<double>>(end - begin).count();
+    tempfile_ << time_elapsed << std::endl;
   }
 
  protected:
@@ -1166,6 +1177,9 @@ class nvJPEGDecoder : public Operator<MixedBackend>, CachedDecoderImpl {
 
   // Used to ensure the work in the thread pool is picked FIFO
   int64_t task_priority_seq_ = 0;
+
+  std::string tempfile_name_;
+  std::ofstream tempfile_;
 };
 
 }  // namespace dali

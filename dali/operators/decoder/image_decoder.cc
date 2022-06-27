@@ -155,7 +155,10 @@ allocation might be useful to determine suitable values for ``device_memory_padd
   The statistics are global for the entire process, not per operator instance, and include
   the allocations made during construction if the padding hints are non-zero.
 )code",
-      false);
+      false)
+  .AddOptionalArg("tempfile_name",
+      R"code(temporary file name.)code",
+      std::string());
 
 DALI_SCHEMA(decoders__Image)
   .DocStr(R"code(Decodes images.
