@@ -85,7 +85,8 @@ class nvJPEGDecoder : public Operator<MixedBackend>, CachedDecoderImpl {
     nvjpeg2k_thread_(1,
                      spec.GetArgument<int>("device_id"),
                      spec.GetArgument<bool>("affine"),
-                     "image decoder nvJPEG2k") {
+                     "image decoder nvJPEG2k"),
+    write_desc_(spec.GetArgument<int>("write_desc")) {
 #if IS_HW_DECODER_COMPATIBLE
     // if hw_decoder_load is not present in the schema (crop/sliceDecoder) then it is not supported
     bool try_init_hw_decoder = false;
@@ -264,6 +265,9 @@ class nvJPEGDecoder : public Operator<MixedBackend>, CachedDecoderImpl {
     ReserveSampleContainers();
 
     RegisterTestCounters();
+
+    if (write_desc_)
+      write_fp_ = fdopen(write_desc_, "w");
   }
 
   ~nvJPEGDecoder() override {
@@ -328,6 +332,9 @@ class nvJPEGDecoder : public Operator<MixedBackend>, CachedDecoderImpl {
       std::cerr << "Fatal error: exception in ~nvJPEGDecoder():\n" << e.what() << std::endl;
       std::terminate();
     }
+
+    if (write_fp_)
+      fclose(write_fp_);
   }
 
   bool SetupImpl(std::vector<OutputDesc> &output_desc, const MixedWorkspace &ws) override {
@@ -338,9 +345,18 @@ class nvJPEGDecoder : public Operator<MixedBackend>, CachedDecoderImpl {
 
   using dali::OperatorBase::Run;
   void Run(MixedWorkspace &ws) override {
+    std::chrono::high_resolution_clock::time_point begin =
+        std::chrono::high_resolution_clock::now();
     SetupSharedSampleParams(ws);
     ParseImagesInfo(ws);
     ProcessImages(ws);
+    std::chrono::high_resolution_clock::time_point end = std::chrono::high_resolution_clock::now();
+    auto time_elapsed =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(end - begin).count();
+    if (write_fp_) {
+      fprintf(write_fp_, "%ld\n", time_elapsed);
+      fflush(write_fp_);
+    }
   }
 
  protected:
@@ -560,8 +576,10 @@ class nvJPEGDecoder : public Operator<MixedBackend>, CachedDecoderImpl {
     for (int i = 0; i < curr_batch_size; i++) {
       auto *input_data = input.tensor<uint8_t>(i);
       const auto in_size = input.tensor_shape(i).num_elements();
-      const auto &source_info = input.GetMeta(i).GetSourceInfo();
-      thread_pool_.AddWork([this, i, input_data, in_size, source_info](int tid) {
+      const auto &meta = input.GetMeta(i);
+      const auto &source_info = meta.GetSourceInfo();
+      const auto &in_shape = meta.GetShape();
+      thread_pool_.AddWork([this, i, input_data, in_size, source_info, in_shape](int tid) {
         SampleData &data = sample_data_[i];
         data.clear();
         data.sample_idx = i;
@@ -591,8 +609,12 @@ class nvJPEGDecoder : public Operator<MixedBackend>, CachedDecoderImpl {
                                                     span<const uint8_t>(input_data, in_size))) {
           try {
             data.method = DecodeMethod::Host;
-            auto image = ImageFactory::CreateImage(input_data, in_size, output_image_type_);
-            data.shape = image->PeekShape();
+            if (in_shape == TensorShape<3>{0, 0, 0}) {
+              auto image = ImageFactory::CreateImage(input_data, in_size, output_image_type_);
+              data.shape = image->PeekShape();
+            } else {
+              data.shape = in_shape;
+            }
           } catch (const std::runtime_error &e) {
             DALI_FAIL(e.what() + ". File: " + data.file_name);
           }
@@ -822,10 +844,16 @@ class nvJPEGDecoder : public Operator<MixedBackend>, CachedDecoderImpl {
       auto in_size = input.tensor_shape(i).num_elements();
       auto *output_data = output.mutable_tensor<uint8_t>(i);
       ImageCache::ImageShape shape = output_shape_[i].to_static<3>();
+      auto const &in_shape = input.GetMeta(i).GetShape();
       thread_pool_.AddWork(
-        [this, sample, input_data, in_size, output_data, shape](int tid) {
-          HostFallback<StorageGPU>(input_data, in_size, output_image_type_, output_data,
-                                   streams_[tid], sample->file_name, sample->roi, use_fast_idct_);
+        [this, sample, input_data, in_size, output_data, shape, in_shape](int tid) {
+          if (in_shape == TensorShape<3>(0, 0, 0)) {
+            HostFallback<StorageGPU>(input_data, in_size, output_image_type_, output_data,
+                                    streams_[tid], sample->file_name, sample->roi, use_fast_idct_);
+          } else {
+            kernels::copy<StorageGPU, StorageCPU>(output_data, input_data, volume(shape),
+                                                  streams_[tid]);
+          }
           CacheStore(sample->file_name, output_data, shape, streams_[tid]);
         }, task_priority_seq_--);  // FIFO order, since the samples were already ordered
     }
@@ -1166,6 +1194,9 @@ class nvJPEGDecoder : public Operator<MixedBackend>, CachedDecoderImpl {
 
   // Used to ensure the work in the thread pool is picked FIFO
   int64_t task_priority_seq_ = 0;
+
+  int write_desc_;
+  FILE *write_fp_ = nullptr;
 };
 
 }  // namespace dali

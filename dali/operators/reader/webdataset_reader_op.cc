@@ -17,6 +17,7 @@
 #include <cstring>
 #include <string>
 #include <utility>
+#include <memory>
 
 namespace dali {
 
@@ -33,7 +34,7 @@ bool WebdatasetReader::SetupImpl(std::vector<OutputDesc>& output_desc, const Hos
   for (int data_idx = 0; data_idx < num_samples; data_idx++) {
     auto& sample = GetSample(data_idx);
     for (int output_idx = 0; output_idx < num_outputs; output_idx++) {
-      output_desc[output_idx].shape.set_tensor_shape(data_idx, sample[output_idx].shape());
+      output_desc[output_idx].shape.set_tensor_shape(data_idx, {0});
       output_desc[output_idx].type = sample[output_idx].type();
     }
   }
@@ -44,27 +45,31 @@ void WebdatasetReader::RunImpl(HostWorkspace& ws) {
   int num_outputs = ws.NumOutput();
   int num_samples = GetCurrBatchSize();
 
-  bool threaded = ws.GetThreadPool().NumThreads() > 1;
+  for (int data_idx = 0; data_idx < num_samples; data_idx++) {
+    auto &meta = GetSample(data_idx).front().GetMeta();
+    while (!meta.AlreadyRead()) {
+      struct io_uring_cqe *cqe;
+      DALI_ENFORCE(io_uring_wait_cqe(ring_.get(), &cqe) == 0,
+                   std::string("io_uring_wait_cqe - ") + std::strerror(errno));
+      auto read_ptr = reinterpret_cast<LoadTarget *>(io_uring_cqe_get_data(cqe));
+      io_uring_cqe_seen(ring_.get(), cqe);
+      read_ptr->front().SetAlreadyRead(true);
+    }
+  }
 
   for (int output_idx = 0; output_idx < num_outputs; output_idx++) {
     auto& output = ws.Output<CPUBackend>(output_idx);
     for (int data_idx = 0; data_idx < num_samples; data_idx++) {
-      auto& sample = GetSample(data_idx);
-      ThreadPool::Work copy_task = [output_idx = output_idx, data_idx = data_idx, &output,
-                                    &sample](int) {
-        output.SetMeta(data_idx, sample[output_idx].GetMeta());
-        std::memcpy(output.raw_mutable_tensor(data_idx), sample[output_idx].raw_data(),
-                    sample[output_idx].nbytes());
-      };
-      if (threaded) {
-        ws.GetThreadPool().AddWork(std::move(copy_task), -data_idx);
-      } else {
-        copy_task(0);
-      }
+      auto& sample_ptr = GetCurrBatch()[data_idx];
+      auto& sample = *sample_ptr;
+      output.SetMeta(data_idx, sample[output_idx].GetMeta());
+      output.UnsafeSetSample(
+          data_idx,
+          std::shared_ptr<void>(sample[output_idx].raw_mutable_data(), [sample_ptr](void*) {}),
+          sample[output_idx].capacity(), sample[output_idx].is_pinned(),
+          sample[output_idx].shape(), sample[output_idx].type(), output.order(),
+          sample[output_idx].GetLayout());
     }
-  }
-  if (threaded) {
-    ws.GetThreadPool().RunAll();
   }
 }
 

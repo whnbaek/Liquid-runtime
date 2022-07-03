@@ -173,6 +173,20 @@ class Tensor : public Buffer<Backend> {
   }
 
   /**
+   * @brief Resizes the buffer to fit `new_size` of new_type elements.
+   * The underlying storage is only reallocated in the case that
+   * the current buffer is not large enough for the requested
+   * number of elements.
+   */
+  inline void Resize(const TensorShape<> &shape, Index new_size, DALIDataType new_type) {
+    DALI_ENFORCE(IsValidType(new_type),
+                 "Tensor cannot be resized with invalid type. To zero out the Tensor "
+                 "Reset() can be used.");
+    resize(new_size, new_type);
+    shape_ = shape;
+  }
+
+  /**
    * @brief Tensor is always backed by contiguous buffer
    */
   bool IsContiguous() const {
@@ -452,6 +466,10 @@ class Tensor : public Buffer<Backend> {
 
   inline bool ShouldSkipSample() const {
     return meta_.ShouldSkipSample();
+  }
+
+  inline void SetAlreadyRead(bool already_read) {
+    meta_.SetAlreadyRead(already_read);
   }
 
  protected:

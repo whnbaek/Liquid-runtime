@@ -155,7 +155,8 @@ allocation might be useful to determine suitable values for ``device_memory_padd
   The statistics are global for the entire process, not per operator instance, and include
   the allocations made during construction if the padding hints are non-zero.
 )code",
-      false);
+      false)
+  .AddOptionalArg("write_desc", R"code(write descriptor)code", 0);
 
 DALI_SCHEMA(decoders__Image)
   .DocStr(R"code(Decodes images.

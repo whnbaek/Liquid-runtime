@@ -52,7 +52,7 @@ DLL_PUBLIC shared_ptr<uint8_t> AllocBuffer(size_t bytes, bool pinned,
                                            int /* device_ordinal */,
                                            AccessOrder order,
                                            CPUBackend *) {
-  const size_t kHostAlignment = 64;  // cache alignment
+  const size_t kHostAlignment = 512;  // cache alignment
   if (pinned) {
     cudaStream_t s = order.has_value() ? order.get() : AccessOrder::host_sync_stream();
     return mm::alloc_raw_async_shared<uint8_t, mm::memory_kind::pinned>(

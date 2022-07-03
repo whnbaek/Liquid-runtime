@@ -220,3 +220,8 @@ list(APPEND DALI_EXCLUDES libcocoapi.a)
 # libcu++
 ##################################################################
 include_directories(SYSTEM ${PROJECT_SOURCE_DIR}/third_party/libcudacxx/include)
+
+##################################################################
+# liburing
+##################################################################
+list(APPEND DALI_LIBS /usr/lib64/liburing.a)

@@ -13,6 +13,10 @@
 // limitations under the License.
 
 #include "dali/operators/reader/loader/webdataset_loader.h"
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
 #include <cstddef>
 #include <cstring>
 #include <limits>
@@ -66,30 +70,45 @@ inline void ParseSampleDesc(std::vector<SampleDesc>& samples_container,
   std::getline(index_file, components_metadata);
   std::stringstream components_stream(components_metadata);
 
+  DALI_ENFORCE(components_stream >> samples_container.back().kind_flag,
+               IndexFileErrMsg(index_path, line, "Could not find kind flag."));
+
   // Reading consecutive components
   ComponentDesc component;
   while (components_stream >> component.ext) {
+    int64_t height, width, channel;
     if (index_version == "v1.2") {
+      DALI_ENFORCE(components_stream >> component.offset >> component.size >> component.filename >>
+                       height >> width >> channel,
+                   IndexFileErrMsg(index_path, line,
+                                   "Could not find all necessary component parameters (offset, "
+                                   "size, filename or shape). Every "
+                                   "record in the index file should look like: `<ext> <offset> "
+                                   "<size> <filename> <height> <width> <channel>`."));
+    } else {
       DALI_ENFORCE(
-          components_stream >> component.offset >> component.size >> component.filename,
+          components_stream >> component.offset >> component.size >> height >> width >> channel,
           IndexFileErrMsg(
               index_path, line,
-              "Could not find all necessary component parameters (offset, size or filename). Every "
-              "record in the index file should look like: `<ext> <offset> <size> <filename>`."));
-    } else {
-      DALI_ENFORCE(components_stream >> component.offset >> component.size,
-                   IndexFileErrMsg(
-                       index_path, line,
-                       "Could not find all necessary component parameters (offset or size). Every "
-                       "record in the index file should look like: `<ext> <offset> <size>`."));
+              "Could not find all necessary component parameters (offset, size or shape). Every "
+              "record in the index file should look like: `<ext> <offset> <size> <height> <width> "
+              "<channel>`."));
     }
+    component.shape = {height, width, channel};
     DALI_ENFORCE(
         component.offset % kBlockSize == 0,
         IndexFileErrMsg(index_path, line, "tar offset is not a multiple of tar block size (",
                         kBlockSize, "), perhaps the size value is exported before offset?"));
+    if (!components_container.empty()) {
+      auto &prev_component = components_container.back();
+      prev_component.extended_size = static_cast<size_t>(component.offset - prev_component.offset);
+    }
     components_container.emplace_back(std::move(component));
     samples_container.back().components.num++;
   }
+  auto &last_component = components_container.back();
+  size_t mask = kBlockSize - 1;
+  last_component.extended_size = (last_component.size + mask) & (~mask);
 
   // Finishing up the SampleDesc
   DALI_ENFORCE(samples_container.back().components.num,
@@ -195,12 +214,13 @@ inline std::string SupportedTypesListGen() {
   return out_str.substr(0, out_str.size() - 2 * (detail::wds::kSupportedTypes.size() > 0));
 }
 
-WebdatasetLoader::WebdatasetLoader(const OpSpec& spec)
+WebdatasetLoader::WebdatasetLoader(const OpSpec& spec, std::shared_ptr<struct io_uring> ring)
     : Loader(spec),
       paths_(spec.GetRepeatedArgument<std::string>("paths")),
       index_paths_(spec.GetRepeatedArgument<std::string>("index_paths")),
       missing_component_behavior_(detail::wds::ParseMissingExtBehavior(
-          spec.GetArgument<std::string>("missing_component_behavior"))) {
+          spec.GetArgument<std::string>("missing_component_behavior"))),
+      ring_(ring) {
   DALI_ENFORCE(paths_.size() == index_paths_.size() || index_paths_.size() == 0,
                make_string("The number of index files, if any, must match the number of archives ",
                "in the dataset"));
@@ -235,9 +255,19 @@ WebdatasetLoader::WebdatasetLoader(const OpSpec& spec)
   }
   DALI_ENFORCE(ext_.size() == dtypes_.size(),
                "Number of extensions does not match the number of provided types");
+
+  DALI_ENFORCE(stick_to_shard_ == true, "stick_to_shard should be true in Liquid system.");
 }
 
-WebdatasetLoader::~WebdatasetLoader() {}
+WebdatasetLoader::~WebdatasetLoader() {
+  io_uring_unregister_files(ring_.get());
+  for (auto &fd : wds_shards_)
+    close(fd);
+  buffer0_.clear();
+  buffer1_.clear();
+  next_buffer0_.clear();
+  next_buffer1_.clear();
+}
 
 void WebdatasetLoader::PrepareEmpty(vector<Tensor<CPUBackend>>& empty) {
   empty = std::vector<Tensor<CPUBackend>>(ext_.size());
@@ -249,35 +279,31 @@ void WebdatasetLoader::PrepareEmpty(vector<Tensor<CPUBackend>>& empty) {
 }
 
 std::string WebdatasetLoader::GetSampleSource(const detail::wds::SampleDesc& sample) {
-  if (generate_index_) {
-    return make_string("tar file at \"", paths_[sample.wds_shard_index], '"');
-  } else {
-    return make_string("index file at \"", index_paths_[sample.wds_shard_index], "\" line ",
-                       sample.line_number);
-  }
+  return make_string("index file at \"", index_paths_[sample.wds_shard_index], "\" line ",
+                      sample.line_number);
 }
 
 
 void WebdatasetLoader::ReadSample(vector<Tensor<CPUBackend>>& sample) {
   MoveToNextShard(sample_index_);
+  while (is_in_buffer_[sample_index_]) {
+    sample_index_++;
+    MoveToNextShard(sample_index_);
+  }
+  is_in_buffer_[sample_index_] = true;
   detail::wds::SampleDesc& current_sample = samples_[sample_index_];
-  auto& current_wds_shard = wds_shards_[current_sample.wds_shard_index];
+  kind_flag_ = current_sample.kind_flag;
+  std::vector<struct iovec> iovs;
 
   for (auto& component : current_sample.components) {
-    // Checking if the component data from the index file agrees with reality
-    DALI_ENFORCE(
-        component.offset < static_cast<int64_t>(current_wds_shard->Size()),
-        IndexFileErrMsg(index_paths_[current_sample.wds_shard_index], current_sample.line_number,
-                        "offset is outside of the archive file"));
-
-    current_wds_shard->Seek(component.offset);
-
     // Skipping cached samples
     const std::string sample_key = make_string_delim(':', paths_[current_sample.wds_shard_index],
                                                      component.offset, component.filename);
 
     DALIMeta meta;
     meta.SetSourceInfo(sample_key);
+    meta.SetShape(component.shape);
+    meta.SetSampleIndex(sample_index_);
     if (ShouldSkipImage(sample_key)) {
       meta.SetSkipSample(true);
       for (auto& output : component.outputs) {
@@ -288,39 +314,38 @@ void WebdatasetLoader::ReadSample(vector<Tensor<CPUBackend>>& sample) {
       continue;
     }
     // Reading Data
-    if (copy_read_data_) {
-      uint8_t* shared_tensor_data = nullptr;
-      bool shared_tensor_is_pinned = false;
-      for (auto& output : component.outputs) {
-        if (!shared_tensor_data) {
-          if (sample[output].shares_data()) {
-            sample[output].Reset();
-          }
-          sample[output].Resize(
-              {static_cast<int64_t>(component.size / sample[output].type_info().size())},
-              dtypes_[output]);
-          shared_tensor_data = reinterpret_cast<uint8_t*>(sample[output].raw_mutable_data());
-          shared_tensor_is_pinned = sample[output].is_pinned();
-        } else {
-          sample[output].ShareData(
-              shared_tensor_data, component.size, shared_tensor_is_pinned,
-              {static_cast<int64_t>(component.size / sample[output].type_info().size())},
-              sample[output].type());
+    uint8_t* shared_tensor_data = nullptr;
+    bool shared_tensor_is_pinned = false;
+    for (auto& output : component.outputs) {
+      if (!shared_tensor_data) {
+        if (sample[output].shares_data()) {
+          sample[output].Reset();
         }
-      }
-      DALI_ENFORCE(current_wds_shard->Read(shared_tensor_data, component.size) == component.size,
-                   "Error reading from a file " + paths_[current_sample.wds_shard_index]);
-    } else {
-      auto data = current_wds_shard->Get(component.size);
-      for (auto& output : component.outputs) {
-        sample[output].SetMeta(meta);
+        sample[output].Resize(
+            {static_cast<int64_t>(component.size / sample[output].type_info().size())},
+            static_cast<Index>(component.extended_size / sample[output].type_info().size()),
+            dtypes_[output]);
+        shared_tensor_data = reinterpret_cast<uint8_t*>(sample[output].raw_mutable_data());
+        shared_tensor_is_pinned = sample[output].is_pinned();
+      } else {
         sample[output].ShareData(
-            data, component.size, false,
+            shared_tensor_data, component.extended_size, shared_tensor_is_pinned,
             {static_cast<int64_t>(component.size / sample[output].type_info().size())},
             sample[output].type());
       }
+      sample[output].SetMeta(meta);
     }
+    struct iovec iov = {shared_tensor_data, component.extended_size};
+    iovs.emplace_back(iov);
   }
+  struct io_uring_sqe *sqe;
+  while ((sqe = io_uring_get_sqe(ring_.get())) == NULL) {}
+  io_uring_prep_readv(sqe, current_sample.wds_shard_index, iovs.data(), iovs.size(),
+                      current_sample.components.begin()->offset);
+  io_uring_sqe_set_data(sqe, &sample);
+  io_uring_sqe_set_flags(sqe, IOSQE_FIXED_FILE);
+  DALI_ENFORCE(io_uring_submit(ring_.get()) == 1,
+               std::string("io_uring_submit - ") + std::strerror(errno));
 
   // Setting non-filled outputs
   for (auto& empty_output : current_sample.empty_outputs) {
@@ -330,26 +355,165 @@ void WebdatasetLoader::ReadSample(vector<Tensor<CPUBackend>>& sample) {
   sample_index_++;
 }
 
+// Get a random read sample
+WebdatasetLoader::LoadTargetSharedPtr WebdatasetLoader::ReadOne(bool is_new_batch) {
+  PrepareMetadata();
+  DomainTimeRange tr("[DALI][Loader] ReadOne", DomainTimeRange::kGreen1);
+  // perform an initial buffer fill if it hasn't already happened
+  if (!initial_buffer_filled_) {
+    DomainTimeRange tr("[DALI][Loader] Filling initial buffer", DomainTimeRange::kBlue1);
+
+    shard_size_ = start_index(shard_id_ + 1, num_shards_, samples_.size()) -
+                  start_index(shard_id_, num_shards_, samples_.size());
+    buffer_fill_ = std::min(static_cast<size_t>(initial_buffer_fill_), shard_size_);
+
+    // Read an initial number of samples to fill our
+    // sample buffer
+    for (size_t i = 0; i < buffer_fill_; ++i) {
+      auto tensor_ptr = LoadTargetSharedPtr(new LoadTarget(),
+        [this](LoadTarget* sample) {
+          auto &meta = sample->front().GetMeta();
+          while (!meta.AlreadyRead()) {
+            struct io_uring_cqe *cqe;
+            DALI_ENFORCE(io_uring_wait_cqe(ring_.get(), &cqe) == 0,
+                         std::string("io_uring_wait_cqe - ") + std::strerror(errno));
+            auto read_ptr = reinterpret_cast<LoadTarget *>(io_uring_cqe_get_data(cqe));
+            io_uring_cqe_seen(ring_.get(), cqe);
+            read_ptr->front().SetAlreadyRead(true);
+          }
+          LoadTargetUniquePtr recycle_ptr(sample);
+          RecycleTensor(std::move(recycle_ptr));
+      });
+      PrepareEmpty(*tensor_ptr);
+      ReadSample(*tensor_ptr);
+      struct io_uring_cqe *cqe;
+      DALI_ENFORCE(io_uring_wait_cqe(ring_.get(), &cqe) == 0,
+                   std::string("io_uring_wait_cqe - ") + std::strerror(errno));
+      auto read_ptr = reinterpret_cast<LoadTarget *>(io_uring_cqe_get_data(cqe));
+      io_uring_cqe_seen(ring_.get(), cqe);
+      read_ptr->front().SetAlreadyRead(true);
+      auto &buffer = kind_flag_ ? buffer1_ : buffer0_;
+      buffer.push_back(tensor_ptr);
+    }
+    buffer0_fill_ = buffer0_.size();
+    buffer1_fill_ = buffer1_.size();
+
+    // need some entries in the empty_tensors_ list
+    DomainTimeRange tr2("[DALI][Loader] Filling empty list", DomainTimeRange::kOrange);
+    std::lock_guard<std::mutex> lock(empty_tensors_mutex_);
+    for (int i = 0; i < initial_empty_size_; ++i) {
+      auto tensor_ptr = LoadTargetUniquePtr(new LoadTarget());
+      PrepareEmpty(*tensor_ptr);
+      empty_tensors_.push_back(std::move(tensor_ptr));
+    }
+
+    initial_buffer_filled_ = true;
+  }
+
+  if (IsNextShardRelative(returned_sample_counter_, shard_id_)) {
+    // If the reader has depleted samples from the given shard, but shards are not equal
+    // and we need to pad samples inside batch (even create a whole new dummy batch) using padding
+    // just to return in each shard the same number of samples and batches within the epoch.
+    // It happened only when pad_last_batch_ is set
+    // First part of this condition makes sure that the same number of batches is returned in each
+    // shard. Second makes sure that padding is done up to the full batch. For the first sample in
+    // the batch is_new_batch is set so it means that padding may be no longer needed
+    if ((returned_sample_counter_  < num_samples(num_shards_, Size()) || !is_new_batch) &&
+      pad_last_batch_) {
+      ++returned_sample_counter_;
+      return last_sample_ptr_tmp;
+    }
+    // remove shard that was fully consumed
+    DALI_ENFORCE(buffer0_.empty() && buffer1_.empty(), "buffer0 and buffer1 should be empty.");
+    std::swap(buffer0_, next_buffer0_);
+    std::swap(buffer1_, next_buffer1_);
+    returned_sample_counter_ = 0;
+  }
+
+  std::vector<LoadTargetSharedPtr> *buffer;
+  Index idx;
+  LoadTargetSharedPtr sample_ptr;
+  size_t next_buffer_size = next_buffer0_.size() + next_buffer1_.size();
+  if (next_buffer_size * shard_size_ <
+      buffer_fill_ * (static_cast<size_t>(returned_sample_counter_) + 1)) {
+    // move from buffer to next_buffer
+    bool kind_flag = next_buffer1_.size() * buffer_fill_ <
+                     buffer1_fill_ * (next_buffer0_.size() + next_buffer1_.size() + 1);
+    buffer = kind_flag ? &buffer1_ : &buffer0_;
+    auto &next_buffer = kind_flag ? next_buffer1_ : next_buffer0_;
+
+    // choose the random index
+    std::uniform_int_distribution<> dis;
+    dis = std::uniform_int_distribution<>(0, buffer->size() - 1);
+
+    idx = shuffle_ ? dis(e_) : 0;
+    next_buffer.push_back(buffer->at(idx));
+  } else {
+    // read and evict
+    LoadTargetSharedPtr tensor_ptr;
+    {
+      std::lock_guard<std::mutex> lock(empty_tensors_mutex_);
+      DALI_ENFORCE(empty_tensors_.size() > 0, "No empty tensors - did you forget to return them?");
+      tensor_ptr = LoadTargetSharedPtr(empty_tensors_.back().release(),
+        [this](LoadTarget* sample) {
+          auto &meta = sample->front().GetMeta();
+          while (!meta.AlreadyRead()) {
+            struct io_uring_cqe *cqe;
+            DALI_ENFORCE(io_uring_wait_cqe(ring_.get(), &cqe) == 0,
+                         std::string("io_uring_wait_cqe - ") + std::strerror(errno));
+            auto read_ptr = reinterpret_cast<LoadTarget *>(io_uring_cqe_get_data(cqe));
+            io_uring_cqe_seen(ring_.get(), cqe);
+            read_ptr->front().SetAlreadyRead(true);
+          }
+          LoadTargetUniquePtr recycle_ptr(sample);
+          RecycleTensor(std::move(recycle_ptr));
+      });
+      empty_tensors_.pop_back();
+    }
+    ReadSample(*tensor_ptr);
+    buffer = kind_flag_ ? &buffer1_ : &buffer0_;
+    buffer->push_back(tensor_ptr);
+
+    // choose the random index
+    std::uniform_int_distribution<> dis;
+    dis = std::uniform_int_distribution<>(0, buffer->size() - 1);
+
+    idx = shuffle_ ? dis(e_) : 0;
+    is_in_buffer_[buffer->at(idx)->front().GetMeta().GetSampleIndex()] = false;
+  }
+  sample_ptr = buffer->at(idx);
+  std::swap(buffer->at(idx), buffer->back());
+  buffer->pop_back();
+  last_sample_ptr_tmp = sample_ptr;
+
+  returned_sample_counter_++;
+  return sample_ptr;
+}
+
 Index WebdatasetLoader::SizeImpl() {
   return samples_.size();
 }
 
 void WebdatasetLoader::PrepareMetadataImpl() {
-  if (!dont_use_mmap_) {
-    mmap_reserver_ = FileStream::MappingReserver(static_cast<unsigned int>(paths_.size()));
-  }
-  copy_read_data_ = dont_use_mmap_ || !mmap_reserver_.CanShareMappedData();
-
-  generate_index_ = index_paths_.size() == 0;
-  if (generate_index_) {
-    DALI_WARN("Index file not provided, it may take some time to infer it from the tar file");
-  }
+  DALI_ENFORCE(index_paths_.size() > 0,
+               "Liquid system does not support when index file not provided.");
 
   // initializing all the readers
   wds_shards_.reserve(paths_.size());
   for (auto& uri : paths_) {
-    wds_shards_.emplace_back(FileStream::Open(uri, read_ahead_, !copy_read_data_));
+    std::string processed_uri;
+    if (uri.find("file://") == 0) {
+      processed_uri = uri.substr(std::string("file://").size());
+    } else {
+      processed_uri = uri;
+    }
+    int fd;
+    DALI_ENFORCE((fd = open(processed_uri.c_str(), O_DIRECT | O_RDONLY)) != -1,
+                 std::string("open - ") + std::strerror(errno));
+    wds_shards_.emplace_back(fd);
   }
+  DALI_ENFORCE(io_uring_register_files(ring_.get(), wds_shards_.data(), wds_shards_.size()) == 0,
+               std::string("io_uring_register_files - ") + std::strerror(errno));
 
   // preparing the map from extensions to outputs
   std::unordered_map<std::string, std::vector<size_t>> ext_map;
@@ -374,19 +538,14 @@ void WebdatasetLoader::PrepareMetadataImpl() {
   for (size_t wds_shard_index = 0; wds_shard_index < paths_.size(); wds_shard_index++) {
     unfiltered_samples.resize(0);
     unfiltered_components.resize(0);
-    if (generate_index_) {
-      detail::wds::ParseTarFile(unfiltered_samples, unfiltered_components,
-                                wds_shards_[wds_shard_index]);
-    } else {
-      detail::wds::ParseIndexFile(unfiltered_samples, unfiltered_components,
-                                  index_paths_[wds_shard_index]);
-    }
+    detail::wds::ParseIndexFile(unfiltered_samples, unfiltered_components,
+                                index_paths_[wds_shard_index]);
 
     for (auto& sample : unfiltered_samples) {
       detail::wds::SampleDesc new_sample{
           detail::wds::VectorRange<detail::wds::ComponentDesc>(components_, components_.size()),
           detail::wds::VectorRange<size_t>(empty_outputs_, empty_outputs_.size()), wds_shard_index,
-          sample.line_number};
+          sample.line_number, sample.kind_flag};
 
       size_t start_outputs_index = output_indicies_.size();
 
@@ -442,6 +601,7 @@ void WebdatasetLoader::PrepareMetadataImpl() {
     }
   }
   sample_index_ = start_index(shard_id_, num_shards_, samples_.size());
+  is_in_buffer_.resize(samples_.size(), false);
 }
 
 void WebdatasetLoader::Reset(bool wrap_to_shard) {

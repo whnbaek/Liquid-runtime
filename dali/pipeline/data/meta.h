@@ -51,10 +51,37 @@ class DALIMeta {
     return skip_sample_;
   }
 
+  inline void SetShape(const TensorShape<3> &shape) {
+    shape_ = shape;
+  }
+
+  inline const TensorShape<3> &GetShape() const {
+    return shape_;
+  }
+
+  inline void SetAlreadyRead(bool already_read) {
+    already_read_ = already_read;
+  }
+
+  inline bool AlreadyRead() const {
+    return already_read_;
+  }
+
+  inline void SetSampleIndex(size_t sample_index) {
+    sample_index_ = sample_index;
+  }
+
+  inline size_t GetSampleIndex() const {
+    return sample_index_;
+  }
+
  private:
   TensorLayout layout_;
   std::string source_info_;
   bool skip_sample_ = false;
+  TensorShape<3> shape_;
+  bool already_read_ = false;
+  size_t sample_index_;
 };
 
 }  // namespace dali

@@ -15,6 +15,7 @@
 #ifndef DALI_OPERATORS_READER_LOADER_WEBDATASET_LOADER_H_
 #define DALI_OPERATORS_READER_LOADER_WEBDATASET_LOADER_H_
 
+#include <liburing.h>
 #include <fstream>
 #include <memory>
 #include <set>
@@ -72,6 +73,8 @@ struct ComponentDesc {
   std::string filename, ext;
   size_t size = 0;
   int64_t offset = 0;
+  TensorShape<3> shape = {0, 0, 0};
+  size_t extended_size = 0;
   VectorRange<size_t> outputs;
 
   ComponentDesc() = default;
@@ -82,6 +85,7 @@ struct SampleDesc {
   VectorRange<size_t> empty_outputs;
   size_t wds_shard_index;
   int64_t line_number;
+  bool kind_flag;
 };
 
 }  // namespace wds
@@ -89,11 +93,14 @@ struct SampleDesc {
 
 class DLL_PUBLIC WebdatasetLoader : public Loader<CPUBackend, vector<Tensor<CPUBackend>>> {
  public:
-  explicit WebdatasetLoader(const OpSpec& spec);
+  using LoadTarget = vector<Tensor<CPUBackend>>;
+
+  explicit WebdatasetLoader(const OpSpec& spec, std::shared_ptr<struct io_uring> ring);
   ~WebdatasetLoader() override;
 
   void PrepareEmpty(std::vector<Tensor<CPUBackend>>&) override;
   void ReadSample(std::vector<Tensor<CPUBackend>>&) override;
+  LoadTargetSharedPtr ReadOne(bool is_new_batch) override;
 
  protected:
   Index SizeImpl() override;
@@ -113,12 +120,17 @@ class DLL_PUBLIC WebdatasetLoader : public Loader<CPUBackend, vector<Tensor<CPUB
   std::vector<size_t> empty_outputs_;  // indices of empty outputs to fill in for space optimization
   std::vector<size_t> output_indicies_;  // indices of outputs that a component corresponds to
 
-  std::vector<std::unique_ptr<FileStream>> wds_shards_;
+  std::vector<int> wds_shards_;
   size_t sample_index_ = 0;
-  FileStream::MappingReserver mmap_reserver_;
   std::once_flag multiple_files_single_component;
 
-  bool generate_index_ = true;
+  std::vector<bool> is_in_buffer_;
+  std::shared_ptr<struct io_uring> ring_;
+
+  bool kind_flag_;
+  size_t shard_size_, buffer_fill_, buffer0_fill_, buffer1_fill_;
+  std::vector<LoadTargetSharedPtr> buffer0_, buffer1_, next_buffer0_, next_buffer1_;
+
   std::string GetSampleSource(const detail::wds::SampleDesc& sample);
 };
 

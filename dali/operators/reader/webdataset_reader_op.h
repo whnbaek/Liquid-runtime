@@ -15,18 +15,29 @@
 #ifndef DALI_OPERATORS_READER_WEBDATASET_READER_OP_H_
 #define DALI_OPERATORS_READER_WEBDATASET_READER_OP_H_
 
+#include <liburing.h>
 #include <vector>
+#include <string>
+#include <memory>
 #include "dali/operators/reader/loader/webdataset_loader.h"
 #include "dali/operators/reader/reader_op.h"
 #include "dali/pipeline/data/tensor.h"
 
 namespace dali {
 
+#define IO_URING_ENTRIES 4096
+
 class DLL_PUBLIC WebdatasetReader : public DataReader<CPUBackend, vector<Tensor<CPUBackend>>> {
  public:
+  using LoadTarget = vector<Tensor<CPUBackend>>;
+
   explicit WebdatasetReader(const OpSpec& spec)
       : DataReader<CPUBackend, vector<Tensor<CPUBackend>>>(spec) {
-    loader_ = InitLoader<WebdatasetLoader>(spec);
+    ring_ = std::shared_ptr<struct io_uring>(new struct io_uring(),
+                            [](struct io_uring* ring) { io_uring_queue_exit(ring); });
+    DALI_ENFORCE(io_uring_queue_init(IO_URING_ENTRIES, ring_.get(), 0) == 0,
+                 std::string("io_uring_queue_init - ") + std::strerror(errno));
+    loader_ = InitLoader<WebdatasetLoader>(spec, ring_);
   }
 
   bool SetupImpl(std::vector<OutputDesc>& output_desc, const HostWorkspace&) override;
@@ -37,6 +48,8 @@ class DLL_PUBLIC WebdatasetReader : public DataReader<CPUBackend, vector<Tensor<
 
  protected:
   USE_READER_OPERATOR_MEMBERS(CPUBackend, vector<Tensor<CPUBackend>>);
+
+  std::shared_ptr<struct io_uring> ring_;
 };
 
 }  // namespace dali
