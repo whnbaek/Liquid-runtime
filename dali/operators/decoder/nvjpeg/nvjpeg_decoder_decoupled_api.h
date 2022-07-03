@@ -87,7 +87,7 @@ class nvJPEGDecoder : public Operator<MixedBackend>, CachedDecoderImpl {
                      spec.GetArgument<int>("device_id"),
                      spec.GetArgument<bool>("affine"),
                      "image decoder nvJPEG2k"),
-    tempfile_name_(spec.GetArgument<std::string>("tempfile_name")) {
+    write_desc_(spec.GetArgument<int>("write_desc")) {
 #if IS_HW_DECODER_COMPATIBLE
     // if hw_decoder_load is not present in the schema (crop/sliceDecoder) then it is not supported
     bool try_init_hw_decoder = false;
@@ -267,7 +267,8 @@ class nvJPEGDecoder : public Operator<MixedBackend>, CachedDecoderImpl {
 
     RegisterTestCounters();
 
-    tempfile_.open(tempfile_name_);
+    if (write_desc_)
+      write_fp_ = fdopen(write_desc_, "w");
   }
 
   ~nvJPEGDecoder() override {
@@ -333,7 +334,8 @@ class nvJPEGDecoder : public Operator<MixedBackend>, CachedDecoderImpl {
       std::terminate();
     }
 
-    tempfile_.close();
+    if (write_fp_)
+      fclose(write_fp_);
   }
 
   bool SetupImpl(std::vector<OutputDesc> &output_desc, const MixedWorkspace &ws) override {
@@ -350,9 +352,12 @@ class nvJPEGDecoder : public Operator<MixedBackend>, CachedDecoderImpl {
     ParseImagesInfo(ws);
     ProcessImages(ws);
     std::chrono::high_resolution_clock::time_point end = std::chrono::high_resolution_clock::now();
-    double time_elapsed =
-        std::chrono::duration_cast<std::chrono::duration<double>>(end - begin).count();
-    tempfile_ << time_elapsed << std::endl;
+    auto time_elapsed =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(end - begin).count();
+    if (write_fp_) {
+      fprintf(write_fp_, "%ld\n", time_elapsed);
+      fflush(write_fp_);
+    }
   }
 
  protected:
@@ -1179,8 +1184,8 @@ class nvJPEGDecoder : public Operator<MixedBackend>, CachedDecoderImpl {
   // Used to ensure the work in the thread pool is picked FIFO
   int64_t task_priority_seq_ = 0;
 
-  std::string tempfile_name_;
-  std::ofstream tempfile_;
+  int write_desc_;
+  FILE *write_fp_ = nullptr;
 };
 
 }  // namespace dali

@@ -156,9 +156,7 @@ allocation might be useful to determine suitable values for ``device_memory_padd
   the allocations made during construction if the padding hints are non-zero.
 )code",
       false)
-  .AddOptionalArg("tempfile_name",
-      R"code(temporary file name.)code",
-      std::string());
+  .AddOptionalArg("write_desc", R"code(write descriptor)code", 0);
 
 DALI_SCHEMA(decoders__Image)
   .DocStr(R"code(Decodes images.
