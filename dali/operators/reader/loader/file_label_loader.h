@@ -308,8 +308,9 @@ class DLL_PUBLIC FileLabelLoader : public Loader<CPUBackend, ImageLabelWrapper> 
         // Resize list to the total size of shards in this node
         for (int sh = 0; sh < num_shards_per_node_; sh++) {
           std::mt19937 gen(shuffle_seed_);
-          Index shard_start_idx = start_index(num_shards_per_node_ * nid + sh, num_shards_, Size());
-          Index shard_end_idx = shard_start_idx + Size() / num_shards_;
+          Index shard_start_idx =
+              start_index(num_shards_per_node_ * nid + sh, num_shards_, SizeImpl());
+          Index shard_end_idx = shard_start_idx + SizeImpl() / num_shards_;
           Index shard_size = shard_end_idx - shard_start_idx;
           vector<int> cache_list_per_shard(shard_size);
           std::iota(cache_list_per_shard.begin(), cache_list_per_shard.end(), shard_start_idx);
@@ -329,7 +330,7 @@ class DLL_PUBLIC FileLabelLoader : public Loader<CPUBackend, ImageLabelWrapper> 
     }
 
     std::mt19937 gen(shuffle_seed_);
-    shm_cache_index_list_.resize(Size() / num_shards_);
+    shm_cache_index_list_.resize(SizeImpl() / num_shards_);
     std::iota(shm_cache_index_list_.begin(), shm_cache_index_list_.end(), index_start_);
     std::shuffle(shm_cache_index_list_.begin(), shm_cache_index_list_.end(), gen);
     shm_cache_index_list_.resize(cache_size_);
