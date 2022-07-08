@@ -249,4 +249,5 @@ which throws some errors. Then,
   $ sed -i 's/__kernel_rwf_t/int/' /usr/include/liburing/io_uring.h
   $ exit
   $ docker commit temp nvidia/dali:cu117_x86_64.build
+  $ docker rm temp
   $ ./build.sh
