@@ -61,11 +61,12 @@ void WebdatasetReader::RunImpl(HostWorkspace& ws) {
     auto& output = ws.Output<CPUBackend>(output_idx);
     for (int data_idx = 0; data_idx < num_samples; data_idx++) {
       auto& sample_ptr = GetCurrBatch()[data_idx];
+      auto tmp = sample_ptr;
       auto& sample = *sample_ptr;
       output.SetMeta(data_idx, sample[output_idx].GetMeta());
       output.UnsafeSetSample(
           data_idx,
-          std::shared_ptr<void>(sample[output_idx].raw_mutable_data(), [sample_ptr](void*) {}),
+          std::shared_ptr<void>(sample[output_idx].raw_mutable_data(), [tmp](void*) {}),
           sample[output_idx].capacity(), sample[output_idx].is_pinned(),
           sample[output_idx].shape(), sample[output_idx].type(), output.order(),
           sample[output_idx].GetLayout());
