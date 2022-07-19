@@ -33,8 +33,10 @@ class DLL_PUBLIC WebdatasetReader : public DataReader<CPUBackend, vector<Tensor<
 
   explicit WebdatasetReader(const OpSpec& spec)
       : DataReader<CPUBackend, vector<Tensor<CPUBackend>>>(spec) {
-    ring_ = std::shared_ptr<struct io_uring>(new struct io_uring(),
-                            [](struct io_uring* ring) { io_uring_queue_exit(ring); });
+    ring_ = std::shared_ptr<io_uring>(new io_uring(), [](io_uring* ring) {
+      io_uring_queue_exit(ring);
+      delete ring;
+    });
     DALI_ENFORCE(io_uring_queue_init(IO_URING_ENTRIES, ring_.get(), 0) == 0,
                  std::string("io_uring_queue_init - ") + std::strerror(errno));
     loader_ = InitLoader<WebdatasetLoader>(spec, ring_);
@@ -49,7 +51,7 @@ class DLL_PUBLIC WebdatasetReader : public DataReader<CPUBackend, vector<Tensor<
  protected:
   USE_READER_OPERATOR_MEMBERS(CPUBackend, vector<Tensor<CPUBackend>>);
 
-  std::shared_ptr<struct io_uring> ring_;
+  std::shared_ptr<io_uring> ring_;
 };
 
 }  // namespace dali

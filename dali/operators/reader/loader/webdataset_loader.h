@@ -95,7 +95,7 @@ class DLL_PUBLIC WebdatasetLoader : public Loader<CPUBackend, vector<Tensor<CPUB
  public:
   using LoadTarget = vector<Tensor<CPUBackend>>;
 
-  explicit WebdatasetLoader(const OpSpec& spec, std::shared_ptr<struct io_uring> ring);
+  explicit WebdatasetLoader(const OpSpec& spec, std::shared_ptr<io_uring>& ring);
   ~WebdatasetLoader() override;
 
   void PrepareEmpty(std::vector<Tensor<CPUBackend>>&) override;
@@ -125,11 +125,13 @@ class DLL_PUBLIC WebdatasetLoader : public Loader<CPUBackend, vector<Tensor<CPUB
   std::once_flag multiple_files_single_component;
 
   std::vector<bool> is_in_buffer_;
-  std::shared_ptr<struct io_uring> ring_;
+  std::shared_ptr<io_uring> ring_;
 
   bool kind_flag_;
   size_t shard_size_, buffer_fill_, buffer0_fill_, buffer1_fill_;
   std::vector<LoadTargetSharedPtr> buffer0_, buffer1_, next_buffer0_, next_buffer1_;
+  std::shared_ptr<std::vector<LoadTargetUniquePtr>> shared_empty_tensors_;
+  std::shared_ptr<std::mutex> shared_empty_tensors_mutex_;
 
   std::string GetSampleSource(const detail::wds::SampleDesc& sample);
 };

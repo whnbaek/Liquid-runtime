@@ -214,7 +214,7 @@ inline std::string SupportedTypesListGen() {
   return out_str.substr(0, out_str.size() - 2 * (detail::wds::kSupportedTypes.size() > 0));
 }
 
-WebdatasetLoader::WebdatasetLoader(const OpSpec& spec, std::shared_ptr<struct io_uring> ring)
+WebdatasetLoader::WebdatasetLoader(const OpSpec& spec, std::shared_ptr<io_uring>& ring)
     : Loader(spec),
       paths_(spec.GetRepeatedArgument<std::string>("paths")),
       index_paths_(spec.GetRepeatedArgument<std::string>("index_paths")),
@@ -257,16 +257,20 @@ WebdatasetLoader::WebdatasetLoader(const OpSpec& spec, std::shared_ptr<struct io
                "Number of extensions does not match the number of provided types");
 
   DALI_ENFORCE(stick_to_shard_ == true, "stick_to_shard should be true in Liquid system.");
+
+  shared_empty_tensors_ =
+      std::shared_ptr<std::vector<LoadTargetUniquePtr>>(new std::vector<LoadTargetUniquePtr>());
+  shared_empty_tensors_mutex_ = std::shared_ptr<std::mutex>(new std::mutex());
 }
 
 WebdatasetLoader::~WebdatasetLoader() {
-  io_uring_unregister_files(ring_.get());
-  for (auto &fd : wds_shards_)
-    close(fd);
   buffer0_.clear();
   buffer1_.clear();
   next_buffer0_.clear();
   next_buffer1_.clear();
+  io_uring_unregister_files(ring_.get());
+  for (auto &fd : wds_shards_)
+    close(fd);
 }
 
 void WebdatasetLoader::PrepareEmpty(vector<Tensor<CPUBackend>>& empty) {
@@ -370,19 +374,25 @@ WebdatasetLoader::LoadTargetSharedPtr WebdatasetLoader::ReadOne(bool is_new_batc
     // Read an initial number of samples to fill our
     // sample buffer
     for (size_t i = 0; i < buffer_fill_; ++i) {
+      auto tensors = shared_empty_tensors_;
+      auto mutex = shared_empty_tensors_mutex_;
+      auto ring = ring_;
       auto tensor_ptr = LoadTargetSharedPtr(new LoadTarget(),
-        [this](LoadTarget* sample) {
+        [tensors, mutex, ring](LoadTarget* sample) {
           auto &meta = sample->front().GetMeta();
           while (!meta.AlreadyRead()) {
             struct io_uring_cqe *cqe;
-            DALI_ENFORCE(io_uring_wait_cqe(ring_.get(), &cqe) == 0,
+            DALI_ENFORCE(io_uring_wait_cqe(ring.get(), &cqe) == 0,
                          std::string("io_uring_wait_cqe - ") + std::strerror(errno));
             auto read_ptr = reinterpret_cast<LoadTarget *>(io_uring_cqe_get_data(cqe));
-            io_uring_cqe_seen(ring_.get(), cqe);
+            io_uring_cqe_seen(ring.get(), cqe);
             read_ptr->front().SetAlreadyRead(true);
           }
           LoadTargetUniquePtr recycle_ptr(sample);
-          RecycleTensor(std::move(recycle_ptr));
+          {
+            std::lock_guard<std::mutex> lock(*mutex);
+            tensors->push_back(std::move(recycle_ptr));
+          }
       });
       PrepareEmpty(*tensor_ptr);
       ReadSample(*tensor_ptr);
@@ -400,11 +410,11 @@ WebdatasetLoader::LoadTargetSharedPtr WebdatasetLoader::ReadOne(bool is_new_batc
 
     // need some entries in the empty_tensors_ list
     DomainTimeRange tr2("[DALI][Loader] Filling empty list", DomainTimeRange::kOrange);
-    std::lock_guard<std::mutex> lock(empty_tensors_mutex_);
+    std::lock_guard<std::mutex> lock(*shared_empty_tensors_mutex_);
     for (int i = 0; i < initial_empty_size_; ++i) {
       auto tensor_ptr = LoadTargetUniquePtr(new LoadTarget());
       PrepareEmpty(*tensor_ptr);
-      empty_tensors_.push_back(std::move(tensor_ptr));
+      shared_empty_tensors_->push_back(std::move(tensor_ptr));
     }
 
     initial_buffer_filled_ = true;
@@ -452,23 +462,30 @@ WebdatasetLoader::LoadTargetSharedPtr WebdatasetLoader::ReadOne(bool is_new_batc
     // read and evict
     LoadTargetSharedPtr tensor_ptr;
     {
-      std::lock_guard<std::mutex> lock(empty_tensors_mutex_);
-      DALI_ENFORCE(empty_tensors_.size() > 0, "No empty tensors - did you forget to return them?");
-      tensor_ptr = LoadTargetSharedPtr(empty_tensors_.back().release(),
-        [this](LoadTarget* sample) {
+      std::lock_guard<std::mutex> lock(*shared_empty_tensors_mutex_);
+      DALI_ENFORCE(shared_empty_tensors_->size() > 0,
+                   "No empty tensors - did you forget to return them?");
+      auto tensors = shared_empty_tensors_;
+      auto mutex = shared_empty_tensors_mutex_;
+      auto ring = ring_;
+      tensor_ptr = LoadTargetSharedPtr(shared_empty_tensors_->back().release(),
+        [tensors, mutex, ring](LoadTarget* sample) {
           auto &meta = sample->front().GetMeta();
           while (!meta.AlreadyRead()) {
             struct io_uring_cqe *cqe;
-            DALI_ENFORCE(io_uring_wait_cqe(ring_.get(), &cqe) == 0,
+            DALI_ENFORCE(io_uring_wait_cqe(ring.get(), &cqe) == 0,
                          std::string("io_uring_wait_cqe - ") + std::strerror(errno));
             auto read_ptr = reinterpret_cast<LoadTarget *>(io_uring_cqe_get_data(cqe));
-            io_uring_cqe_seen(ring_.get(), cqe);
+            io_uring_cqe_seen(ring.get(), cqe);
             read_ptr->front().SetAlreadyRead(true);
           }
           LoadTargetUniquePtr recycle_ptr(sample);
-          RecycleTensor(std::move(recycle_ptr));
+          {
+            std::lock_guard<std::mutex> lock(*mutex);
+            tensors->push_back(std::move(recycle_ptr));
+          }
       });
-      empty_tensors_.pop_back();
+      shared_empty_tensors_->pop_back();
     }
     ReadSample(*tensor_ptr);
     buffer = kind_flag_ ? &buffer1_ : &buffer0_;
