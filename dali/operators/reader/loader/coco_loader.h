@@ -184,6 +184,15 @@ class DLL_PUBLIC CocoLoader : public FileLabelLoader {
     }
 
     DALI_ENFORCE(SizeImpl() > 0, "No files found.");
+
+    Index size_per_shard = SizeImpl() / num_shards_;
+    if (cache_size_orig_ > size_per_shard) {
+      extra_cache_size_ = cache_size_orig_ - size_per_shard;
+      cache_size_ = size_per_shard;
+    } else {
+      cache_size_ = cache_size_orig_;
+    }
+
     if (shuffle_) {
       // seeded with hardcoded value to get
       // the same sequence on every shard
