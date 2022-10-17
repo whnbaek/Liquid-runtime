@@ -15,7 +15,9 @@
 #ifndef DALI_PIPELINE_DATA_META_H_
 #define DALI_PIPELINE_DATA_META_H_
 
+#include <sys/uio.h>
 #include <string>
+#include <vector>
 #include "dali/pipeline/data/types.h"
 
 namespace dali {
@@ -75,6 +77,14 @@ class DALIMeta {
     return sample_index_;
   }
 
+  inline void SetIovecs(std::vector<struct iovec> &iovs) {
+    iovs_ = iovs;
+  }
+
+  inline const std::vector<struct iovec>& GetIovecs() const {
+    return iovs_;
+  }
+
  private:
   TensorLayout layout_;
   std::string source_info_;
@@ -82,6 +92,7 @@ class DALIMeta {
   TensorShape<3> shape_;
   bool already_read_ = false;
   size_t sample_index_;
+  std::vector<struct iovec> iovs_;
 };
 
 }  // namespace dali

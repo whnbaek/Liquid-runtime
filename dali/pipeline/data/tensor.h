@@ -440,6 +440,10 @@ class Tensor : public Buffer<Backend> {
     return meta_;
   }
 
+  DALIMeta *GetMetaPtr() {
+    return &meta_;
+  }
+
   void SetMeta(const DALIMeta &meta)  {
     meta_ = meta;
   }
@@ -466,10 +470,6 @@ class Tensor : public Buffer<Backend> {
 
   inline bool ShouldSkipSample() const {
     return meta_.ShouldSkipSample();
-  }
-
-  inline void SetAlreadyRead(bool already_read) {
-    meta_.SetAlreadyRead(already_read);
   }
 
  protected:

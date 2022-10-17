@@ -125,6 +125,7 @@ class DLL_PUBLIC WebdatasetLoader : public Loader<CPUBackend, vector<Tensor<CPUB
   std::once_flag multiple_files_single_component;
 
   std::vector<bool> is_in_buffer_;
+  int sector_size_;
   std::shared_ptr<io_uring> ring_;
 
   bool kind_flag_;

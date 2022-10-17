@@ -58,7 +58,7 @@ inline MissingExtBehavior ParseMissingExtBehavior(std::string missing_component_
 inline void ParseSampleDesc(std::vector<SampleDesc>& samples_container,
                             std::vector<ComponentDesc>& components_container,
                             std::ifstream& index_file, const std::string& index_path, int64_t line,
-                            const std::string& index_version) {
+                            const std::string& index_version, int sector_size) {
   // Preparing the SampleDesc
   samples_container.emplace_back();
   samples_container.back().components =
@@ -96,9 +96,9 @@ inline void ParseSampleDesc(std::vector<SampleDesc>& samples_container,
     }
     component.shape = {height, width, channel};
     DALI_ENFORCE(
-        component.offset % kBlockSize == 0,
-        IndexFileErrMsg(index_path, line, "tar offset is not a multiple of tar block size (",
-                        kBlockSize, "), perhaps the size value is exported before offset?"));
+        component.offset % sector_size == 0,
+        IndexFileErrMsg(index_path, line, "tar offset is not a multiple of sector size (",
+                        sector_size, "), perhaps the size value is exported before offset?"));
     if (!components_container.empty()) {
       auto &prev_component = components_container.back();
       prev_component.extended_size = static_cast<size_t>(component.offset - prev_component.offset);
@@ -107,7 +107,7 @@ inline void ParseSampleDesc(std::vector<SampleDesc>& samples_container,
     samples_container.back().components.num++;
   }
   auto &last_component = components_container.back();
-  size_t mask = kBlockSize - 1;
+  size_t mask = sector_size - 1;
   last_component.extended_size = (last_component.size + mask) & (~mask);
 
   // Finishing up the SampleDesc
@@ -117,7 +117,7 @@ inline void ParseSampleDesc(std::vector<SampleDesc>& samples_container,
 
 inline void ParseIndexFile(std::vector<SampleDesc>& samples_container,
                            std::vector<ComponentDesc>& components_container,
-                           const std::string& index_path) {
+                           const std::string& index_path, int sector_size) {
   std::ifstream index_file(index_path);
 
   // Index Checking
@@ -143,7 +143,7 @@ inline void ParseIndexFile(std::vector<SampleDesc>& samples_container,
   samples_container.reserve(samples_container.size() + sample_desc_num);
   for (size_t sample_index = 0; sample_index < sample_desc_num; sample_index++) {
     ParseSampleDesc(samples_container, components_container, index_file, index_path,
-                    sample_index + 1, index_version);
+                    sample_index + 1, index_version, sector_size);
   }
 }
 
@@ -220,6 +220,7 @@ WebdatasetLoader::WebdatasetLoader(const OpSpec& spec, std::shared_ptr<io_uring>
       index_paths_(spec.GetRepeatedArgument<std::string>("index_paths")),
       missing_component_behavior_(detail::wds::ParseMissingExtBehavior(
           spec.GetArgument<std::string>("missing_component_behavior"))),
+      sector_size_(spec.GetArgument<int>("sector_size")),
       ring_(ring) {
   DALI_ENFORCE(paths_.size() == index_paths_.size() || index_paths_.size() == 0,
                make_string("The number of index files, if any, must match the number of archives ",
@@ -342,11 +343,13 @@ void WebdatasetLoader::ReadSample(vector<Tensor<CPUBackend>>& sample) {
     struct iovec iov = {shared_tensor_data, component.extended_size};
     iovs.emplace_back(iov);
   }
+  sample.front().GetMetaPtr()->SetIovecs(iovs);
+  auto &new_iovs = sample.front().GetMeta().GetIovecs();
   struct io_uring_sqe *sqe;
   while ((sqe = io_uring_get_sqe(ring_.get())) == NULL) {}
-  io_uring_prep_readv(sqe, current_sample.wds_shard_index, iovs.data(), iovs.size(),
+  io_uring_prep_readv(sqe, current_sample.wds_shard_index, new_iovs.data(), new_iovs.size(),
                       current_sample.components.begin()->offset);
-  io_uring_sqe_set_data(sqe, &sample);
+  io_uring_sqe_set_data(sqe, sample.front().GetMetaPtr());
   io_uring_sqe_set_flags(sqe, IOSQE_FIXED_FILE);
   DALI_ENFORCE(io_uring_submit(ring_.get()) == 1,
                std::string("io_uring_submit - ") + std::strerror(errno));
@@ -384,9 +387,9 @@ WebdatasetLoader::LoadTargetSharedPtr WebdatasetLoader::ReadOne(bool is_new_batc
             struct io_uring_cqe *cqe;
             DALI_ENFORCE(io_uring_wait_cqe(ring.get(), &cqe) == 0,
                          std::string("io_uring_wait_cqe - ") + std::strerror(errno));
-            auto read_ptr = reinterpret_cast<LoadTarget *>(io_uring_cqe_get_data(cqe));
+            DALI_ENFORCE(cqe->res >= 0, std::strerror(-cqe->res));
+            reinterpret_cast<DALIMeta *>(io_uring_cqe_get_data(cqe))->SetAlreadyRead(true);
             io_uring_cqe_seen(ring.get(), cqe);
-            read_ptr->front().SetAlreadyRead(true);
           }
           LoadTargetUniquePtr recycle_ptr(sample);
           {
@@ -399,9 +402,9 @@ WebdatasetLoader::LoadTargetSharedPtr WebdatasetLoader::ReadOne(bool is_new_batc
       struct io_uring_cqe *cqe;
       DALI_ENFORCE(io_uring_wait_cqe(ring_.get(), &cqe) == 0,
                    std::string("io_uring_wait_cqe - ") + std::strerror(errno));
-      auto read_ptr = reinterpret_cast<LoadTarget *>(io_uring_cqe_get_data(cqe));
+      DALI_ENFORCE(cqe->res >= 0, std::strerror(-cqe->res));
+      reinterpret_cast<DALIMeta *>(io_uring_cqe_get_data(cqe))->SetAlreadyRead(true);
       io_uring_cqe_seen(ring_.get(), cqe);
-      read_ptr->front().SetAlreadyRead(true);
       auto &buffer = kind_flag_ ? buffer1_ : buffer0_;
       buffer.push_back(tensor_ptr);
     }
@@ -475,9 +478,9 @@ WebdatasetLoader::LoadTargetSharedPtr WebdatasetLoader::ReadOne(bool is_new_batc
             struct io_uring_cqe *cqe;
             DALI_ENFORCE(io_uring_wait_cqe(ring.get(), &cqe) == 0,
                          std::string("io_uring_wait_cqe - ") + std::strerror(errno));
-            auto read_ptr = reinterpret_cast<LoadTarget *>(io_uring_cqe_get_data(cqe));
+            DALI_ENFORCE(cqe->res >= 0, std::strerror(-cqe->res));
+            reinterpret_cast<DALIMeta *>(io_uring_cqe_get_data(cqe))->SetAlreadyRead(true);
             io_uring_cqe_seen(ring.get(), cqe);
-            read_ptr->front().SetAlreadyRead(true);
           }
           LoadTargetUniquePtr recycle_ptr(sample);
           {
@@ -556,7 +559,7 @@ void WebdatasetLoader::PrepareMetadataImpl() {
     unfiltered_samples.resize(0);
     unfiltered_components.resize(0);
     detail::wds::ParseIndexFile(unfiltered_samples, unfiltered_components,
-                                index_paths_[wds_shard_index]);
+                                index_paths_[wds_shard_index], sector_size_);
 
     for (auto& sample : unfiltered_samples) {
       detail::wds::SampleDesc new_sample{

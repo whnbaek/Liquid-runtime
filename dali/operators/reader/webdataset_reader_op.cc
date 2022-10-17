@@ -51,22 +51,22 @@ void WebdatasetReader::RunImpl(HostWorkspace& ws) {
       struct io_uring_cqe *cqe;
       DALI_ENFORCE(io_uring_wait_cqe(ring_.get(), &cqe) == 0,
                    std::string("io_uring_wait_cqe - ") + std::strerror(errno));
-      auto read_ptr = reinterpret_cast<LoadTarget *>(io_uring_cqe_get_data(cqe));
+      DALI_ENFORCE(cqe->res >= 0, std::strerror(-cqe->res));
+      reinterpret_cast<DALIMeta *>(io_uring_cqe_get_data(cqe))->SetAlreadyRead(true);
       io_uring_cqe_seen(ring_.get(), cqe);
-      read_ptr->front().SetAlreadyRead(true);
     }
   }
 
+  auto& curr_batch = GetCurrBatch();
   for (int output_idx = 0; output_idx < num_outputs; output_idx++) {
     auto& output = ws.Output<CPUBackend>(output_idx);
     for (int data_idx = 0; data_idx < num_samples; data_idx++) {
-      auto& sample_ptr = GetCurrBatch()[data_idx];
-      auto tmp = sample_ptr;
+      auto sample_ptr = curr_batch[data_idx];
       auto& sample = *sample_ptr;
       output.SetMeta(data_idx, sample[output_idx].GetMeta());
       output.UnsafeSetSample(
           data_idx,
-          std::shared_ptr<void>(sample[output_idx].raw_mutable_data(), [tmp](void*) {}),
+          std::shared_ptr<void>(sample[output_idx].raw_mutable_data(), [sample_ptr](void*) {}),
           sample[output_idx].capacity(), sample[output_idx].is_pinned(),
           sample[output_idx].shape(), sample[output_idx].type(), output.order(),
           sample[output_idx].GetLayout());
@@ -151,6 +151,10 @@ Moreover, the tar file should be constructed so that it will only output a sampl
 divisible by the size of the data type.)code",
                     DALI_DATA_TYPE_VEC,
                     nullptr)  // default is a vector of uint8
+    .AddOptionalArg("sector_size", R"code(Sector size of the drive where datsets are placed.
+
+The default sector size is 512. Only 512, 1024, 2048, 4096 are allowed.)code", 512)
+
     .AddParent("LoaderBase");
 
 DALI_REGISTER_OPERATOR(readers__Webdataset, WebdatasetReader, CPU);
