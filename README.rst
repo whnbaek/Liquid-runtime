@@ -230,24 +230,3 @@ Simon Layton, Andrei Ivanov and Serge Panev.
 .. |LGTM Python badge| image:: https://img.shields.io/lgtm/grade/python/g/NVIDIA/DALI.svg?logo=lgtm&logoWidth=18
    :target: https://lgtm.com/projects/g/NVIDIA/DALI/context:python
    :alt: Language grade: Python
-
-How to compile
---------------
-
-First, try to compile,
-
-  $ cd docker
-  $ ./build.sh
-
-which throws some errors. Then,
-
-  $ docker run -it --name temp nvidia/dali:cu117_x86_64.build
-  $ wget https://vault.centos.org/centos/8/AppStream/x86_64/os/Packages/liburing-1.0.7-3.el8.x86_64.rpm
-  $ yum install -y liburing-1.0.7-3.el8.x86_64.rpm
-  $ wget https://vault.centos.org/centos/8/PowerTools/x86_64/os/Packages/liburing-devel-1.0.7-3.el8.x86_64.rpm
-  $ yum install -y liburing-devel-1.0.7-3.el8.x86_64.rpm
-  $ sed -i 's/__kernel_rwf_t/int/' /usr/include/liburing/io_uring.h
-  $ exit
-  $ docker commit temp nvidia/dali:cu117_x86_64.build
-  $ docker rm temp
-  $ ./build.sh
